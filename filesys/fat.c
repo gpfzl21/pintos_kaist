@@ -24,6 +24,9 @@ struct fat_fs {
 	disk_sector_t data_start;
 	cluster_t last_clst;
 	struct lock write_lock;
+
+	// our code
+	unsigned int count_free_clst;
 };
 
 static struct fat_fs *fat_fs;
@@ -153,11 +156,36 @@ fat_boot_create (void) {
 void
 fat_fs_init (void) {
 	/* TODO: Your code goes here. */
+	fat_fs->fat = NULL;
+	fat_fs->fat_length = fat_fs->bs.fat_sectors * DISK_SECTOR_SIZE / sizeof(cluster_t);
+	fat_fs->data_start = fat_fs->bs.fat_sectors + fat_fs->bs.fat_start;
+	fat_fs->last_clst = (fat_fs->bs.total_sectors - fat_fs->data_start) * SECTORS_PER_CLUSTER;
+	lock_init(&fat_fs->write_lock);
+	fat_fs->count_free_clst = fat_fs->last_clst - 1;
+	printf("fat_length is %d\n", fat_fs->fat_length);
+	printf("last_clst is %d\n", fat_fs->last_clst);
 }
 
 /*----------------------------------------------------------------------------*/
 /* FAT handling                                                               */
 /*----------------------------------------------------------------------------*/
+
+/* our code:
+ * Find free clst.
+ * Returns 0 if fails to find free clst. */
+static cluster_t
+find_free_clst (void) {
+	if (fat_fs->count_free_clst == 0) {
+		return 0;
+	}
+	cluster_t free_clst = 1;
+	for (free_clst = 1; free_clst <= fat_fs->last_clst; free_clst++) {
+		if (fat_fs->fat[free_clst] == 0) {
+			return free_clst;
+		}
+	}
+	return 0;
+}
 
 /* Add a cluster to the chain.
  * If CLST is 0, start a new chain.
@@ -165,6 +193,28 @@ fat_fs_init (void) {
 cluster_t
 fat_create_chain (cluster_t clst) {
 	/* TODO: Your code goes here. */
+	cluster_t free_clst;
+	free_clst = find_free_clst();
+	
+	// Fail to allocate a new cluster
+	if (free_clst == 0) {
+		return 0;
+	}
+
+	unsigned int *fat = fat_fs->fat;
+	
+	if (clst == 0) {	// if clst is 0
+		fat[free_clst] = EOChain;
+	} else {			// if clst is not 0
+		// assume that given clst is EOChain
+		fat[free_clst] = EOChain;
+		fat[clst] = free_clst;
+	}
+
+	// free clst 개수 줄어듬
+	fat_fs->count_free_clst--;
+	
+	return free_clst;
 }
 
 /* Remove the chain of clusters starting from CLST.
@@ -172,22 +222,60 @@ fat_create_chain (cluster_t clst) {
 void
 fat_remove_chain (cluster_t clst, cluster_t pclst) {
 	/* TODO: Your code goes here. */
+	unsigned int *fat = fat_fs->fat;
+
+	// PCLST must be the direct previous cluster of CLST if CLST is not the fisrt element of the chain
+	ASSERT(pclst == 0 || fat[pclst] == clst);
+
+	// Remove chain
+	cluster_t iter_clst = clst;
+	while (iter_clst != EOChain) {
+		cluster_t next_clst = fat[iter_clst];
+		fat[iter_clst] = 0;
+		iter_clst = next_clst;
+
+		// fat 개수 늘어남
+		fat_fs->count_free_clst++;
+	}
+
+	// Update PCLST to EOChain. Note that if pclst is 0, there's nothing to do.
+	if (pclst != 0) {
+		fat[pclst] = EOChain;
+	}
 }
 
 /* Update a value in the FAT table. */
 void
 fat_put (cluster_t clst, cluster_t val) {
 	/* TODO: Your code goes here. */
+	unsigned int *fat = fat_fs->fat;
+	fat[clst] = val;
 }
 
 /* Fetch a value in the FAT table. */
 cluster_t
 fat_get (cluster_t clst) {
 	/* TODO: Your code goes here. */
+	unsigned int *fat = fat_fs->fat;
+	return fat[clst];
 }
 
 /* Covert a cluster # to a sector number. */
 disk_sector_t
 cluster_to_sector (cluster_t clst) {
 	/* TODO: Your code goes here. */
+	return clst + fat_fs->bs.fat_sectors;
+}
+
+// Covert a sector # to a cluster number.
+cluster_t
+sector_to_cluster (disk_sector_t sector) {
+	/* TODO: Your code goes here. */
+	return sector - fat_fs->bs.fat_sectors;
+}
+
+// free cluster count
+size_t
+fat_count_free_clst (void) {
+	return fat_fs->count_free_clst;
 }

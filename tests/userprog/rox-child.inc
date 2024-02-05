@@ -16,6 +16,7 @@ test_main (void)
   CHECK ((handle = open ("child-rox")) > 1, "open \"child-rox\"");
   CHECK (read (handle, buffer, sizeof buffer) == (int) sizeof buffer,
          "read \"child-rox\"");
+  
   seek (handle, 0);
   CHECK (write (handle, buffer, sizeof buffer) == (int) sizeof buffer,
          "write \"child-rox\"");

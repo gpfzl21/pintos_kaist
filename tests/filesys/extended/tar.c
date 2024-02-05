@@ -15,6 +15,9 @@ main (int argc, char *argv[])
 {
   if (argc < 3)
     usage ();
+  
+  // for debug
+  // msg("for debug: argc value is %d", argc);
 
   return (make_tar_archive (argv[1], argv + 2, argc - 2)
           ? EXIT_SUCCESS : EXIT_FAILURE);
@@ -75,6 +78,8 @@ make_tar_archive (const char *archive_name, char *files[], size_t file_cnt)
                          archive_fd, &write_error))
         success = false;
     }
+  
+  // msg("for debug: success to archive, now we do_write");
 
   if (!do_write (archive_fd, zeros, 512, &write_error)
       || !do_write (archive_fd, zeros, 512, &write_error)) 
@@ -96,6 +101,7 @@ archive_file (char file_name[], size_t file_name_size,
 
       if (inumber (file_fd) != inumber (archive_fd)) 
         {
+          
           if (!isdir (file_fd))
             success = archive_ordinary_file (file_name, file_fd,
                                              archive_fd, write_error);
@@ -128,6 +134,8 @@ archive_ordinary_file (const char *file_name, int file_fd,
   bool success = true;
   int file_size = filesize (file_fd);
 
+  // msg("for debug: start archive_ordinary_file");
+
   if (!write_header (file_name, '0', file_size, 0644, archive_fd, write_error))
     return false;
 
@@ -151,6 +159,8 @@ archive_ordinary_file (const char *file_name, int file_fd,
 
       file_size -= chunk_size;
     }
+  
+  // msg("for debug: finish archive_ordinary_file");
 
   return success;
 }
@@ -161,22 +171,30 @@ archive_directory (char file_name[], size_t file_name_size, int file_fd,
 {
   size_t dir_len;
   bool success = true;
+  // msg("for debug: start archive_directory");
 
   dir_len = strlen (file_name);
+  // msg("for debug: dir_length is %d", dir_len);
   if (dir_len + 1 + READDIR_MAX_LEN + 1 > file_name_size) 
     {
       printf ("%s: file name too long\n", file_name);
       return false;
     }
 
+  // msg("for debug: start write_header");
   if (!write_header (file_name, '5', 0, 0755, archive_fd, write_error))
     return false;
+  // msg("for debug: finish write_header");
       
   file_name[dir_len] = '/';
-  while (readdir (file_fd, &file_name[dir_len + 1])) 
+  // msg("for debug: start archive files under directory", dir_len);
+  while (readdir (file_fd, &file_name[dir_len + 1])) {
+    // msg("for debug: readdir... name is %s", file_name);
     if (!archive_file (file_name, file_name_size, archive_fd, write_error))
       success = false;
+  }
   file_name[dir_len] = '\0';
+  // msg("for debug: finish archive every files under directory\n", dir_len);
 
   return success;
 }

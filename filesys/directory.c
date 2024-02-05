@@ -6,6 +6,10 @@
 #include "filesys/inode.h"
 #include "threads/malloc.h"
 
+// our code
+#include "filesys/fat.h"
+#include "threads/thread.h"
+
 /* A directory. */
 struct dir {
 	struct inode *inode;                /* Backing store. */
@@ -23,7 +27,7 @@ struct dir_entry {
  * given SECTOR.  Returns true if successful, false on failure. */
 bool
 dir_create (disk_sector_t sector, size_t entry_cnt) {
-	return inode_create (sector, entry_cnt * sizeof (struct dir_entry));
+	return inode_create (sector, entry_cnt * sizeof (struct dir_entry), 1, 0);
 }
 
 /* Opens and returns the directory for the given INODE, of which
@@ -42,11 +46,18 @@ dir_open (struct inode *inode) {
 	}
 }
 
+
 /* Opens the root directory and returns a directory for it.
  * Return true if successful, false on failure. */
 struct dir *
 dir_open_root (void) {
-	return dir_open (inode_open (ROOT_DIR_SECTOR));
+	struct dir *root_dir;
+#ifdef EFILESYS
+	root_dir = dir_open (inode_open (cluster_to_sector(ROOT_DIR_CLUSTER)));
+#else
+	root_dir = dir_open (inode_open (ROOT_DIR_SECTOR));
+#endif
+	root_dir;
 }
 
 /* Opens and returns a new directory for the same inode as DIR.
@@ -175,6 +186,9 @@ dir_remove (struct dir *dir, const char *name) {
 	ASSERT (dir != NULL);
 	ASSERT (name != NULL);
 
+	if(!strcmp(name, ".") || !strcmp(name,".."))
+		goto done;
+
 	/* Find directory entry. */
 	if (!lookup (dir, name, &e, &ofs))
 		goto done;
@@ -184,6 +198,24 @@ dir_remove (struct dir *dir, const char *name) {
 	if (inode == NULL)
 		goto done;
 
+	// 디렉토리 엔트리가 디렉토리고, 거기에다가 항까지 있으면 터뜨림
+	struct dir *entry_dir = NULL;
+	if (inode_is_dir(inode)) {
+		entry_dir = dir_open(inode);
+
+		struct dir_entry f;
+		off_t offs;
+
+		for (offs = 0; inode_read_at (entry_dir->inode, &f, sizeof f, offs) ==
+			 sizeof f; offs += sizeof f) {
+				 // 이용중인게 있으면 터지는데, 단 .과 ..은 예외
+			if (f.in_use && strcmp(f.name, ".") && strcmp(f.name,"..")) {
+				dir_close(entry_dir);
+				goto done;
+			}
+		}
+	}
+
 	/* Erase directory entry. */
 	e.in_use = false;
 	if (inode_write_at (dir->inode, &e, sizeof e, ofs) != sizeof e)
@@ -191,10 +223,14 @@ dir_remove (struct dir *dir, const char *name) {
 
 	/* Remove inode. */
 	inode_remove (inode);
+	if (entry_dir != NULL) {
+		dir_close(entry_dir);
+	} else {
+		inode_close(inode);
+	}
 	success = true;
 
 done:
-	inode_close (inode);
 	return success;
 }
 
@@ -213,4 +249,114 @@ dir_readdir (struct dir *dir, char name[NAME_MAX + 1]) {
 		}
 	}
 	return false;
+}
+
+struct dir*
+path_to_dir (char *path_name, char *file_name) {
+
+	struct dir *dir;
+	if (strlen(path_name) == 0) {
+		return NULL;
+	}
+	if (path_name == NULL) {
+		return NULL;
+	}
+	// determine root or not
+	if (path_name[0] == '/') {
+		dir = dir_open_root();
+	} else {
+		dir = dir_reopen(thread_current()->curr_dir);
+	}
+
+	char *path_name_copy = palloc_get_page(0);
+	if (path_name_copy == NULL)
+		return TID_ERROR;
+	strlcpy(path_name_copy, path_name, 1 << 12);
+
+	char *p;
+	char *next_p;
+	char *temp_p;
+
+	p = strtok_r(path_name_copy, "/", &temp_p);
+	next_p = strtok_r(NULL, "/", &temp_p);
+
+	// 사용자가 디렉토리처럼 a/b 같이 쓴 경우
+	while (p != NULL && next_p != NULL) {
+		struct inode *inode = NULL;
+
+		// 애초에 디렉토리에 없는걸 적은 경우
+		if (!dir_lookup(dir, p, &inode)) {
+			goto inval;
+		}
+
+		// /a/b/c/d에서 c가 파일도 symbolic link도 아닌 경우
+		if (!inode_is_dir(inode) && !inode_is_sym(inode)) {
+			goto inval;
+		}
+
+		while (inode_is_sym(inode)) {
+			char *temp_name = malloc(NAME_MAX + 1);
+			inode_read_at(inode, temp_name, NAME_MAX + 1, 0);
+			disk_sector_t temp_dir_sec;
+			inode_read_at(inode, &temp_dir_sec, sizeof(temp_dir_sec), 16);
+			struct inode *temp_dir_inode = inode_open(temp_dir_sec);
+			struct dir *temp_dir = dir_open(temp_dir_inode);
+
+			struct inode *sym_inode = NULL;
+			if (!dir_lookup(temp_dir, temp_name, &sym_inode)) {
+				dir_close(temp_dir);
+				free(temp_name);
+				inode_close(inode);
+				return NULL;
+			}
+			dir_close(temp_dir);
+			free(temp_name);
+			inode_close(inode);
+			
+			inode = sym_inode;
+		}
+
+		if (!inode_is_dir(inode)) {
+			inode_close(inode);
+			goto inval;
+		}
+
+		dir_close(dir);
+		dir = dir_open(inode);
+
+		p = next_p;
+		next_p = strtok_r(NULL, "/", &temp_p);
+	}
+
+	if (p == NULL) {
+		strlcpy(file_name, "/", 2);
+		palloc_free_page(path_name_copy);
+		return dir;
+	}
+
+	if (strlen(p) > NAME_MAX) {
+		goto inval;
+	}
+	
+
+	strlcpy(file_name, p, strlen(p) + 1);
+
+	palloc_free_page(path_name_copy);
+
+	return dir;
+
+inval:
+	dir_close(dir);
+	palloc_free_page(path_name_copy);
+	return NULL;
+}
+
+size_t 
+sizeof_dir_struct(void) {
+	return sizeof(struct dir);
+}
+
+int32_t 
+dir_get_pos(struct dir *dir) {
+	return dir->pos;
 }

@@ -21,8 +21,9 @@ test_main (void)
 	  if (child[i] == 0) {
 	  	if(exec ("child-swap") == -1)
             fail("exec \"child-swap\"");
-	  }
+	    }
     }
+
 	/* Wait for children */
     for(i =0; i < CHILD_CNT; i++) {
   	  if(wait (child[i]) != 0)

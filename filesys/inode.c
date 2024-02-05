@@ -7,16 +7,29 @@
 #include "filesys/free-map.h"
 #include "threads/malloc.h"
 
+// our code
+#include "filesys/fat.h"
+#include "threads/synch.h"
+
 /* Identifies an inode. */
 #define INODE_MAGIC 0x494e4f44
 
 /* On-disk inode.
  * Must be exactly DISK_SECTOR_SIZE bytes long. */
 struct inode_disk {
+#ifdef EFILESYS
+	cluster_t start;					/* First data cluster. */
+#else
 	disk_sector_t start;                /* First data sector. */
+#endif
 	off_t length;                       /* File size in bytes. */
 	unsigned magic;                     /* Magic number. */
-	uint32_t unused[125];               /* Not used. */
+	uint32_t is_dir;					/* dir = 1 , file = 0 */
+	uint32_t is_sym;
+
+	uint32_t count_alloc_sectors;		// 할당된 섹터 수
+
+	uint32_t unused[122];               /* Not used. */
 };
 
 /* Returns the number of sectors to allocate for an inode SIZE
@@ -34,6 +47,10 @@ struct inode {
 	bool removed;                       /* True if deleted, false otherwise. */
 	int deny_write_cnt;                 /* 0: writes ok, >0: deny writes. */
 	struct inode_disk data;             /* Inode content. */
+#ifdef EFILESYS
+	struct semaphore inode_sema;		/* on-disk inode 편집시 사용 */
+	// struct semaphore expand_file_sema;  // file 확장할때 걸어준다
+#endif
 };
 
 /* Returns the disk sector that contains byte offset POS within
@@ -43,9 +60,18 @@ struct inode {
 static disk_sector_t
 byte_to_sector (const struct inode *inode, off_t pos) {
 	ASSERT (inode != NULL);
-	if (pos < inode->data.length)
+	if (pos < inode->data.length) {
+#ifdef EFILESYS
+		unsigned int offset = pos / DISK_SECTOR_SIZE;
+		cluster_t iter_clst = inode->data.start;
+		for (unsigned int i = 0; i < offset; i++) {
+			iter_clst = fat_get(iter_clst);
+		}
+		return cluster_to_sector(iter_clst);
+#else
 		return inode->data.start + pos / DISK_SECTOR_SIZE;
-	else
+#endif
+	} else
 		return -1;
 }
 
@@ -65,7 +91,7 @@ inode_init (void) {
  * Returns true if successful.
  * Returns false if memory or disk allocation fails. */
 bool
-inode_create (disk_sector_t sector, off_t length) {
+inode_create (disk_sector_t sector, off_t length, uint32_t is_dir, uint32_t is_sym) {
 	struct inode_disk *disk_inode = NULL;
 	bool success = false;
 
@@ -75,11 +101,42 @@ inode_create (disk_sector_t sector, off_t length) {
 	 * one sector in size, and you should fix that. */
 	ASSERT (sizeof *disk_inode == DISK_SECTOR_SIZE);
 
+	// 해당 섹터는 이미 할당되었다고 가정
 	disk_inode = calloc (1, sizeof *disk_inode);
 	if (disk_inode != NULL) {
 		size_t sectors = bytes_to_sectors (length);
 		disk_inode->length = length;
 		disk_inode->magic = INODE_MAGIC;
+		disk_inode->is_dir = is_dir;
+		disk_inode->is_sym = is_sym;
+
+#ifdef EFILESYS
+		if (sectors == 0) {
+			disk_inode->count_alloc_sectors = 1;
+		} else {
+			disk_inode->count_alloc_sectors = sectors;
+		}
+		if (fat_count_free_clst() >= sectors && fat_count_free_clst() >= 1) {
+			disk_inode->start = fat_create_chain(0);
+
+			disk_write (filesys_disk, sector, disk_inode);
+			uint8_t *buf = calloc (1, DISK_SECTOR_SIZE);
+			disk_write (filesys_disk, cluster_to_sector(disk_inode->start), buf);
+			free(buf);
+			if (sectors > 0) {
+				uint8_t *buf = calloc (1, DISK_SECTOR_SIZE);
+
+				cluster_t iter_clst = disk_inode->start;
+
+				for (size_t i = 1; i < sectors; i++) {
+					iter_clst = fat_create_chain(iter_clst);
+					disk_write (filesys_disk, cluster_to_sector(iter_clst), buf);
+				}
+				free(buf);
+			}
+			success = true;
+		}
+#else
 		if (free_map_allocate (sectors, &disk_inode->start)) {
 			disk_write (filesys_disk, sector, disk_inode);
 			if (sectors > 0) {
@@ -91,6 +148,7 @@ inode_create (disk_sector_t sector, off_t length) {
 			}
 			success = true; 
 		} 
+#endif
 		free (disk_inode);
 	}
 	return success;
@@ -125,9 +183,15 @@ inode_open (disk_sector_t sector) {
 	inode->open_cnt = 1;
 	inode->deny_write_cnt = 0;
 	inode->removed = false;
+
+#ifdef EFILESYS
+	// our code
+	sema_init(&inode->inode_sema, 1);
+#endif
 	disk_read (filesys_disk, inode->sector, &inode->data);
 	return inode;
 }
+
 
 /* Reopens and returns INODE. */
 struct inode *
@@ -159,9 +223,14 @@ inode_close (struct inode *inode) {
 
 		/* Deallocate blocks if removed. */
 		if (inode->removed) {
+#ifdef EFILESYS
+			fat_remove_chain(sector_to_cluster(inode->sector), 0);
+			fat_remove_chain(inode->data.start, 0);
+#else
 			free_map_release (inode->sector, 1);
 			free_map_release (inode->data.start,
 					bytes_to_sectors (inode->data.length)); 
+#endif
 		}
 
 		free (inode); 
@@ -173,7 +242,7 @@ inode_close (struct inode *inode) {
 void
 inode_remove (struct inode *inode) {
 	ASSERT (inode != NULL);
-	inode->removed = true;
+	inode->removed = true;	
 }
 
 /* Reads SIZE bytes from INODE into BUFFER, starting at position OFFSET.
@@ -184,6 +253,12 @@ inode_read_at (struct inode *inode, void *buffer_, off_t size, off_t offset) {
 	uint8_t *buffer = buffer_;
 	off_t bytes_read = 0;
 	uint8_t *bounce = NULL;
+
+#ifdef EFILESYS
+	if (size + offset > inode->data.length) {
+		return bytes_read;
+	}
+#endif
 
 	while (size > 0) {
 		/* Disk sector to read, starting byte offset within sector. */
@@ -225,6 +300,40 @@ inode_read_at (struct inode *inode, void *buffer_, off_t size, off_t offset) {
 	return bytes_read;
 }
 
+
+static size_t
+count_eof_sectors (uint32_t allocated_sectors, off_t size, off_t offset) {
+	// 추가 할당 섹터 수 계산
+	size_t eof_bytes =
+		((int) size + (int) offset - (int) (allocated_sectors * DISK_SECTOR_SIZE) < 0) ?
+		0 : (size + offset - (allocated_sectors * DISK_SECTOR_SIZE)); 
+	size_t eof_sector_count = bytes_to_sectors(eof_bytes);
+
+	return eof_sector_count;
+}
+
+static void
+assign_eof_sectors (size_t eof_sector_count, struct inode_disk *disk_inode) {
+
+	if (eof_sector_count == 0)
+		return;
+
+	cluster_t iter_clst = disk_inode->start;
+	while (fat_get(iter_clst) != EOChain) {
+		iter_clst = fat_get(iter_clst);
+	}
+
+	uint8_t *buf = calloc (1, DISK_SECTOR_SIZE);
+
+	for (size_t i = 0; i < eof_sector_count; i++) {
+		iter_clst = fat_create_chain(iter_clst);
+		disk_write(filesys_disk, cluster_to_sector(iter_clst), buf);
+	}
+
+	free(buf);
+
+}
+
 /* Writes SIZE bytes from BUFFER into INODE, starting at OFFSET.
  * Returns the number of bytes actually written, which may be
  * less than SIZE if end of file is reached or an error occurs.
@@ -237,8 +346,25 @@ inode_write_at (struct inode *inode, const void *buffer_, off_t size,
 	off_t bytes_written = 0;
 	uint8_t *bounce = NULL;
 
+
 	if (inode->deny_write_cnt)
 		return 0;
+	
+#ifdef EFILESYS
+	// eof sizes in sectors
+	size_t increase_size = count_eof_sectors (inode->data.count_alloc_sectors, size, offset);
+	if (increase_size > fat_count_free_clst) {
+		return 0;
+	}
+	assign_eof_sectors(increase_size, &inode->data);
+
+	inode->data.count_alloc_sectors += increase_size;
+	if (size + offset > inode->data.length) {
+		sema_down(&inode->inode_sema);
+		inode->data.length = size + offset;
+	}
+	disk_write(filesys_disk ,inode->sector, &inode->data);
+#endif
 
 	while (size > 0) {
 		/* Sector to write, starting byte offset within sector. */
@@ -282,6 +408,12 @@ inode_write_at (struct inode *inode, const void *buffer_, off_t size,
 		offset += chunk_size;
 		bytes_written += chunk_size;
 	}
+
+#ifdef EFILESYS
+	if (inode->inode_sema.value == 0)
+		sema_up(&inode->inode_sema);
+#endif
+	
 	free (bounce);
 
 	return bytes_written;
@@ -310,4 +442,20 @@ inode_allow_write (struct inode *inode) {
 off_t
 inode_length (const struct inode *inode) {
 	return inode->data.length;
+}
+
+bool
+inode_is_dir (const struct inode *inode) {
+	return inode->data.is_dir;
+}
+
+
+int
+inode_open_count (struct inode *inode) {
+	return inode->open_cnt;
+}
+
+bool
+inode_is_sym (struct inode *inode) {
+	return inode->data.is_sym;
 }

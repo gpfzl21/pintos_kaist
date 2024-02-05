@@ -16,6 +16,18 @@ bool sema_try_down (struct semaphore *);
 void sema_up (struct semaphore *);
 void sema_self_test (void);
 
+/* One semaphore in a list. */
+struct semaphore_elem {
+	struct list_elem elem;              /* List element. */
+	struct semaphore semaphore;         /* This semaphore. */
+};
+
+/*
+ * our declartion
+ */
+bool compare_sema_p_prior_to_q (const struct list_elem *p, const struct list_elem *q, void *aux);
+
+
 /* Lock. */
 struct lock {
 	struct thread *holder;      /* Thread holding lock (for debugging). */

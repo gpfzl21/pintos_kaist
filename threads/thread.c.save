@@ -35,7 +35,7 @@ static struct list sleep_list;
 int64_t next_wakeup_tick;
 
 /*
- *   MLFQ         
+ *         MLFQ         
  */
 int load_avg;
 
@@ -140,16 +140,15 @@ void go_sleep_thread(int64_t ticks){
 
 // make thread wake up
 void wakeup_thread(int64_t ticks){
-	next_wakeup_tick = INT64_MAX;
+	//next_wakeup_tick = INT64_MAX;
 	for (struct list_elem *ele = list_begin(&sleep_list); ele != list_end(&sleep_list);) {
 		struct thread *t = list_entry(ele, struct thread, elem);
-		int wakeup_tick_t = t -> wakeup_tick;
-		if(ticks >= wakeup_tick_t){
+		if(ticks >= t->wakeup_tick){
 			ele = list_remove(&t->elem);
 			thread_unblock(t);
 		} else {
 			ele = list_next(ele);
-			update_next_wakeup_tick(wakeup_tick_t);
+			update_next_wakeup_tick(t->wakeup_tick);
 		}
 	}
 }
@@ -322,9 +321,6 @@ thread_init (void) {
 	init_thread (initial_thread, "main", PRI_DEFAULT);
 	initial_thread->status = THREAD_RUNNING;
 	initial_thread->tid = allocate_tid ();
-
-	// project 4
-	initial_thread->curr_dir = NULL;
 }
 
 /* Starts preemptive thread scheduling by enabling interrupts.
@@ -417,41 +413,6 @@ thread_create (const char *name, int priority,
 	t->tf.ss = SEL_KDSEG;
 	t->tf.cs = SEL_KCSEG;
 	t->tf.eflags = FLAG_IF;
-	
-	struct thread *parent = thread_current();
-
-	#ifdef USERPROG
-		// initialize wait_sema
-		sema_init(&t->wait_sema, 0);
-		// initialize delay_break_sema
-		sema_init(&t->delay_break_sema, 0);
-		// initialize fork_sema 0으로
-		sema_init(&t->fork_sema, 0);
-		// remember parent
-		t->parent_thread = parent;
-		// initialize load status
-		t->load_status = false;
-		// initialize terminate status
-		t->terminate_status = false;
-		// add to child list
-		list_push_back(&parent->child_list, &t->child_elem);
-
-		t->exec_file = NULL;
-		
-
-		/*
-		 * for file
-		 */
-		t -> next_fd = 2;
-		list_init(&t -> fd_table);
-
-	#endif
-
-	if (parent->curr_dir != NULL) {
-		struct dir *parent_dir = parent->curr_dir;
-		t->curr_dir = dir_reopen(parent_dir);
-	}
-	
 
 	/* Add to run queue. */
 	thread_unblock (t);
@@ -710,12 +671,6 @@ init_thread (struct thread *t, const char *name, int priority) {
 
 	t -> nice = NICE_DEFAULT;
 	t -> recent_cpu = RECENT_CPU_DEFAULT;
-
-	// User program struct initailize
-
-	#ifdef USERPROG
-		list_init(&t-> child_list);
-	#endif
 
 }
 
